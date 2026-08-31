@@ -40,58 +40,63 @@ const HEARTBEAT_MS = 5000
 const STALE_MS = 15_000
 const MAX_MESSAGES = 2000
 
-let rootDir: string
-let hugsDir: string
-let stateFile: string
-let logFile: string
-let sessionId = randomUUID()
-let agentName = ""
-let board: Board = { agents: {}, locks: {}, messages: [] }
-
 function now(): number {
   return Date.now()
-}
-
-function ensureDirs() {
-  fs.mkdirSync(hugsDir, { recursive: true })
-}
-
-function writeTextAtomic(file: string, content: string) {
-  const tmp = file + "." + sessionId + ".tmp"
-  fs.writeFileSync(tmp, content, "utf8")
-  fs.renameSync(tmp, file)
-}
-
-function writeBoard() {
-  ensureDirs()
-  writeTextAtomic(stateFile, JSON.stringify(board, null, 2))
-}
-
-function readBoard(): Board {
-  try {
-    if (!fs.existsSync(stateFile)) {
-      board = { agents: {}, locks: {}, messages: [] }
-      return board
-    }
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8")) as Board
-    board = {
-      agents: parsed.agents ?? {},
-      locks: parsed.locks ?? {},
-      messages: Array.isArray(parsed.messages) ? parsed.messages : [],
-    }
-    return board
-  } catch {
-    board = { agents: {}, locks: {}, messages: [] }
-    return board
-  }
 }
 
 function isStale(ts: number): boolean {
   return now() - ts > STALE_MS
 }
 
-function pruneStaleLocks() {
-  const snap = readBoard()
+type Instance = {
+  hugsDir: string
+  stateFile: string
+  logFile: string
+  sessionId: string
+  agentName: string
+  board: Board
+}
+
+function writeTextAtomic(file: string, content: string, tmpSuffix: string) {
+  const tmp = file + "." + tmpSuffix + ".tmp"
+  fs.writeFileSync(tmp, content, "utf8")
+  fs.renameSync(tmp, file)
+}
+
+function readBoard(inst: Instance): Board {
+  try {
+    if (!fs.existsSync(inst.stateFile)) {
+      inst.board = { agents: {}, locks: {}, messages: [] }
+      return inst.board
+    }
+    const parsed = JSON.parse(fs.readFileSync(inst.stateFile, "utf8")) as Board
+    inst.board = {
+      agents: parsed.agents ?? {},
+      locks: parsed.locks ?? {},
+      messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+    }
+    return inst.board
+  } catch {
+    inst.board = { agents: {}, locks: {}, messages: [] }
+    return inst.board
+  }
+}
+
+function pushMessage(inst: Instance, b: Board, m: Omit<MessageEntry, "id" | "ts" | "agent" | "session"> & { agent?: string; session?: string }) {
+  b.messages.push({
+    id: randomUUID(),
+    ts: now(),
+    agent: m.agent ?? inst.agentName,
+    session: m.session ?? inst.sessionId,
+    ...m,
+  } as MessageEntry)
+  if (b.messages.length > MAX_MESSAGES) {
+    b.messages = b.messages.slice(b.messages.length - MAX_MESSAGES)
+  }
+}
+
+function pruneStaleLocks(inst: Instance) {
+  const snap = readBoard(inst)
   const liveSessions = new Set<string>()
   for (const [id, agent] of Object.entries(snap.agents)) {
     if (!isStale(agent.lastSeen)) liveSessions.add(id)
@@ -101,7 +106,7 @@ function pruneStaleLocks() {
     const expired = !liveSessions.has(lock.session) || now() - lock.since > lock.ttl
     if (expired) {
       delete snap.locks[file]
-      pushMessage(snap, {
+      pushMessage(inst, snap, {
         kind: "unlock",
         text: `Lock on "${file}" expired (holder gone or ttl passed)`,
         file,
@@ -110,20 +115,30 @@ function pruneStaleLocks() {
   }
 }
 
-function pushMessage(b: Board, m: Omit<MessageEntry, "id" | "ts" | "agent" | "session"> & { agent?: string; session?: string }) {
-  b.messages.push({
-    id: randomUUID(),
-    ts: now(),
-    agent: m.agent ?? agentName,
-    session: m.session ?? sessionId,
-    ...m,
-  } as MessageEntry)
-  if (b.messages.length > MAX_MESSAGES) {
-    b.messages = b.messages.slice(b.messages.length - MAX_MESSAGES)
+function persist(inst: Instance, b: Board) {
+  inst.board = b
+  fs.mkdirSync(inst.hugsDir, { recursive: true })
+  try {
+    writeTextAtomic(inst.stateFile, JSON.stringify(b, null, 2), inst.sessionId)
+  } catch {
+    /* state write is best-effort under races */
+  }
+  try {
+    writeTextAtomic(inst.logFile, renderHtml(inst, b), inst.sessionId)
+  } catch {
+    /* html render is best-effort */
   }
 }
 
-function renderHtml(): string {
+function withBoard<T>(inst: Instance, fn: (b: Board) => T): T {
+  const b = readBoard(inst)
+  pruneStaleLocks(inst)
+  const res = fn(b)
+  persist(inst, b)
+  return res
+}
+
+function renderHtml(inst: Instance, board: Board): string {
   const fmt = (ts: number) => {
     const d = new Date(ts)
     const p = (n: number) => String(n).padStart(2, "0")
@@ -271,60 +286,47 @@ function renderHtml(): string {
 </html>`
 }
 
-function persist(b: Board) {
-  board = b
-  if (hugsDir === undefined) return
-  writeBoard()
-  try {
-    writeTextAtomic(logFile, renderHtml())
-  } catch {
-    /* html render is best-effort */
+export const AgentHugs: Plugin = async ({ project, directory }) => {
+  const inst: Instance = {
+    hugsDir: "",
+    stateFile: "",
+    logFile: "",
+    sessionId: randomUUID(),
+    agentName: "",
+    board: { agents: {}, locks: {}, messages: [] },
   }
-}
 
-function withBoard<T>(fn: (b: Board) => T): T {
-  const b = readBoard()
-  pruneStaleLocks()
-  const res = fn(b)
-  persist(b)
-  return res
-}
+  inst.hugsDir = path.join(directory, ".agenthugs")
+  inst.stateFile = path.join(inst.hugsDir, "state.json")
+  inst.logFile = path.join(inst.hugsDir, "log.html")
 
-function heartbeat() {
-  withBoard((b) => {
-    if (b.agents[sessionId]) {
-      b.agents[sessionId].lastSeen = now()
-    }
-  })
-}
+  const base = path.basename(project?.worktree || directory) || "agent"
+  inst.agentName = `${base}@${String(process.pid).slice(-4)}`
 
-export const AgentHugs: Plugin = async ({ project, directory, client }) => {
-  rootDir = directory
-  hugsDir = path.join(rootDir, ".agenthugs")
-  stateFile = path.join(hugsDir, "state.json")
-  logFile = path.join(hugsDir, "log.html")
-
-  const base = path.basename(project?.worktree || rootDir) || "agent"
-  agentName = `${base}·${String(process.pid).slice(-4)}`
-
-  ensureDirs()
-  withBoard((b) => {
-    b.agents[sessionId] = {
-      name: agentName,
+  fs.mkdirSync(inst.hugsDir, { recursive: true })
+  withBoard(inst, (b) => {
+    b.agents[inst.sessionId] = {
+      name: inst.agentName,
       pid: process.pid,
-      session: sessionId,
+      session: inst.sessionId,
       lastSeen: now(),
       status: "online",
     }
-    pushMessage(b, { kind: "join", text: `${agentName} connected to the project.` })
+    pushMessage(inst, b, { kind: "join", text: `${inst.agentName} connected to the project.` })
   })
 
-  const beat = setInterval(heartbeat, HEARTBEAT_MS)
+  const beat = setInterval(() => {
+    withBoard(inst, (b) => {
+      if (b.agents[inst.sessionId]) {
+        b.agents[inst.sessionId].lastSeen = now()
+      }
+    })
+  }, HEARTBEAT_MS)
 
-  const htmlPath = logFile
+  const htmlPath = inst.logFile
 
   const say = (text: string) => {
-    withBoard((b) => pushMessage(b, { kind: "status", text }))
+    withBoard(inst, (b) => pushMessage(inst, b, { kind: "status", text }))
     return `"${text}" shared with all agents. Open/refresh ${htmlPath} to view the log.`
   }
 
@@ -332,12 +334,12 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
     dispose: async () => {
       clearInterval(beat)
       try {
-        withBoard((b) => {
-          if (b.agents[sessionId]) b.agents[sessionId].lastSeen = 0
+        withBoard(inst, (b) => {
+          if (b.agents[inst.sessionId]) b.agents[inst.sessionId].lastSeen = 0
           for (const [f, l] of Object.entries(b.locks)) {
-            if (l.session === sessionId) delete b.locks[f]
+            if (l.session === inst.sessionId) delete b.locks[f]
           }
-          pushMessage(b, { kind: "leave", text: `${agentName} disconnected.` })
+          pushMessage(inst, b, { kind: "leave", text: `${inst.agentName} disconnected.` })
         })
       } catch {
         /* board may already be gone */
@@ -350,7 +352,7 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
       if (toolName === "edit" || toolName === "write") {
         const filePath = (args as { filePath?: string }).filePath
         if (filePath) {
-          withBoard((b) => pushMessage(b, { kind: "edit", text: "edited file", file: filePath.replace(/\\/g, "/") }))
+          withBoard(inst, (b) => pushMessage(inst, b, { kind: "edit", text: "edited file", file: filePath.replace(/\\/g, "/") }))
         }
       }
     },
@@ -362,9 +364,9 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
         const filePath = (args as { filePath?: string }).filePath
         if (filePath) {
           const rel = filePath.replace(/\\/g, "/")
-          const b = readBoard()
+          const b = readBoard(inst)
           const lock = b.locks[rel]
-          if (lock && lock.session !== sessionId) {
+          if (lock && lock.session !== inst.sessionId) {
             const holder = b.agents[lock.session]
             throw new Error(`Cannot edit "${rel}": it is locked by ${holder ? holder.name : lock.session}.${lock.reason ? " Reason: " + lock.reason : ""} Use hug_status, coordinate with hug_send, or wait for them to unlock.`)
           }
@@ -389,8 +391,8 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
           "Read the current Agent Hugs board: who else is connected, what each agent is doing, which files are currently locked (and by whom), and the recent activity feed. Check this before and while editing shared files.",
         args: {},
         async execute() {
-          const b = readBoard()
-          pruneStaleLocks()
+          const b = readBoard(inst)
+          pruneStaleLocks(inst)
           const alive = Object.values(b.agents).filter((a) => !isStale(a.lastSeen))
           const locks = Object.entries(b.locks).map(([f, l]) => {
             const holder = b.agents[l.session]
@@ -424,16 +426,16 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
         async execute(args) {
           const rel = args.file.replace(/\\/g, "/")
           const ttl = args.ttl_seconds && args.ttl_seconds > 0 ? args.ttl_seconds * 1000 : 600_000
-          return withBoard((b) => {
-            pruneStaleLocks()
+          return withBoard(inst, (b) => {
+            pruneStaleLocks(inst)
             const existing = b.locks[rel]
-            if (existing && existing.session !== sessionId) {
+            if (existing && existing.session !== inst.sessionId) {
               const holder = b.agents[existing.session]
-              pushMessage(b, { kind: "lock", text: `${agentName} tried to lock "${rel}" but it's held by ${holder ? holder.name : existing.session}.` })
+              pushMessage(inst, b, { kind: "lock", text: `${inst.agentName} tried to lock "${rel}" but it's held by ${holder ? holder.name : existing.session}.` })
               return `CONFLICT: "${rel}" is already locked by ${holder ? holder.name : existing.session}. ${existing.reason ? "Reason: " + existing.reason + ". " : ""}Wait for them to unlock, or coordinate via hug_send.`
             }
-            b.locks[rel] = { agent: agentName, session: sessionId, reason: args.reason ?? "", since: now(), ttl }
-            pushMessage(b, { kind: "lock", text: `${agentName} locked "${rel}".${args.reason ? " Reason: " + args.reason : ""}`, file: rel })
+            b.locks[rel] = { agent: inst.agentName, session: inst.sessionId, reason: args.reason ?? "", since: now(), ttl }
+            pushMessage(inst, b, { kind: "lock", text: `${inst.agentName} locked "${rel}".${args.reason ? " Reason: " + args.reason : ""}`, file: rel })
             return `LOCKED "${rel}" for ${ttl / 1000}s. Remember to hug_unlock when done. Other agents will now steer clear.`
           })
         },
@@ -446,21 +448,21 @@ export const AgentHugs: Plugin = async ({ project, directory, client }) => {
           file: tool.schema.string().describe("Project-relative path of the file you locked. (Optional — omit to release every lock you hold.)").optional(),
         },
         async execute(args) {
-          return withBoard((b) => {
-            pruneStaleLocks()
-            const mine = Object.entries(b.locks).filter(([, l]) => l.session === sessionId)
+          return withBoard(inst, (b) => {
+            pruneStaleLocks(inst)
+            const mine = Object.entries(b.locks).filter(([, l]) => l.session === inst.sessionId)
             if (args.file) {
               const rel = args.file.replace(/\\/g, "/")
               const l = b.locks[rel]
               if (!l) return `No lock exists on "${rel}".`
-              if (l.session !== sessionId) return `You don't hold the lock on "${rel}" — ${b.agents[l.session]?.name ?? l.session} does.`
+              if (l.session !== inst.sessionId) return `You don't hold the lock on "${rel}" — ${b.agents[l.session]?.name ?? l.session} does.`
               delete b.locks[rel]
-              pushMessage(b, { kind: "unlock", text: `${agentName} released "${rel}".`, file: rel })
+              pushMessage(inst, b, { kind: "unlock", text: `${inst.agentName} released "${rel}".`, file: rel })
               return `Unlocked "${rel}".`
             } else {
               const released = mine.map(([f]) => {
                 delete b.locks[f]
-                pushMessage(b, { kind: "unlock", text: `${agentName} released "${f}".`, file: f })
+                pushMessage(inst, b, { kind: "unlock", text: `${inst.agentName} released "${f}".`, file: f })
                 return f
               })
               return released.length ? `Unlocked: ${released.join(", ")}` : "You hold no locks."
